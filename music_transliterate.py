@@ -13,8 +13,9 @@ import os
 import re
 import sys
 import unicodedata
-from pathlib import Path
 import random
+from pathlib import Path
+from typing import Dict, Optional, Tuple, Set, List, Any
 
 
 class FileTransliterator:
@@ -103,7 +104,7 @@ class FileTransliterator:
             'е': 'e', 'є': 'ye', 'ж': 'zh', 'з': 'z', 'и': 'y', 'і': 'i',
             'ї': 'yi', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
             'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-            'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', ' ш': 'sh', 'щ': 'shch',
+            'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
             'ь': "'", 'ю': 'yu', 'я': 'ya'
         }
         
@@ -456,7 +457,7 @@ class FileTransliterator:
             traceback.print_exc()
             return False
     
-    def process_directory(self, directory_path: str):
+    def process_directory(self, directory_path: str) -> bool:
         """Обрабатывает все файлы в указанной директории"""
         path = Path(directory_path)
         
@@ -541,7 +542,6 @@ class FileTransliterator:
         return True
 
 
-
 def add_number_prefixes(directory, flag_ge_1000=False):
     """
     Добавляет к именам файлов в указанном каталоге случайные числовые префиксы.
@@ -559,24 +559,33 @@ def add_number_prefixes(directory, flag_ge_1000=False):
     min_value = 1000 if flag_ge_1000 else 1
     max_value = 9999
     
-    # Регулярное выражение для поиска существующего префикса
+    # Регулярное выражение для поиска существующего префикса (4 цифры + пробел в начале)
     prefix_pattern = re.compile(r'^\d{4}\s')
     
+    # Собираем все файлы в каталоге
+    files = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
+    
+    if not files:
+        print(f"Каталог '{directory}' не содержит файлов")
+        return
+    
+    print(f"\n" + "=" * 50)
+    print(f"Добавление числовых префиксов...")
+    print(f"Найдено {len(files)} файлов для добавления префиксов")
+    print(f"Диапазон префиксов: {min_value:04d}-{max_value:04d}\n")
+    
     # Обрабатываем файлы в каталоге
-    for filename in os.listdir(directory):
+    for filename in files:
         filepath = os.path.join(directory, filename)
-        
-        # Пропускаем подкаталоги, обрабатываем только файлы
-        if not os.path.isfile(filepath):
-            continue
         
         # Удаляем существующий префикс, если он есть
         new_name = filename
         if prefix_pattern.match(filename):
             # Удаляем первые 5 символов (4 цифры + пробел)
             new_name = filename[5:]
+            print(f"  Удален существующий префикс у файла: {filename}")
         
-        # Генерируем новый случайный префикс
+        # Генерируем случайный префикс
         random_number = random.randint(min_value, max_value)
         prefix = f"{random_number:04d} "
         
@@ -587,35 +596,121 @@ def add_number_prefixes(directory, flag_ge_1000=False):
         new_filepath = os.path.join(directory, final_name)
         try:
             os.rename(filepath, new_filepath)
-            print(f"Переименован: {filename} -> {final_name}")
+            print(f"✓ Добавлен префикс: {filename} -> {final_name}")
         except Exception as e:
-            print(f"Ошибка при переименовании {filename}: {e}")
+            print(f"✗ Ошибка при переименовании {filename}: {e}")
 
+
+def process_directory_with_prefixes(directory_path: str, flag_ge_1000: bool = False):
+    """
+    Полный процесс обработки директории: транслитерация + добавление префиксов
+    """
+    transliterator = FileTransliterator()
+    
+    print("=" * 70)
+    print("НАЧАЛО ОБРАБОТКИ ДИРЕКТОРИИ")
+    print("=" * 70)
+    
+    # Шаг 1: Транслитерация имен файлов и ID3-тегов
+    print("\n" + "=" * 50)
+    print("ШАГ 1: ТРАНСЛИТЕРАЦИЯ ИМЕН ФАЙЛОВ И ID3-ТЕГОВ")
+    print("=" * 50)
+    
+    try:
+        success = transliterator.process_directory(directory_path)
+        if not success:
+            print("\n" + "=" * 50)
+            print("Транслитерация прервана из-за ошибок")
+            return False
+    except Exception as e:
+        print(f"\nОшибка при транслитерации: {e}")
+        return False
+    
+    # Шаг 2: Добавление числовых префиксов
+    print("\n" + "=" * 50)
+    print("ШАГ 2: ДОБАВЛЕНИЕ ЧИСЛОВЫХ ПРЕФИКСОВ")
+    print("=" * 50)
+    
+    try:
+        add_number_prefixes(directory_path, flag_ge_1000)
+    except Exception as e:
+        print(f"\nОшибка при добавлении префиксов: {e}")
+        return False
+    
+    return True
 
 
 def main():
     """Основная функция программы"""
-    if len(sys.argv) != 2:
-        print("Использование: python transliterate_files.py <путь_к_директории>")
+    if len(sys.argv) < 2:
+        print("Использование:")
+        print("  python transliterate_files.py <путь_к_директории> [--ge-1000] [--only-prefixes] [--only-transliterate]")
+        print("\nОпции:")
+        print("  --ge-1000          : Использовать префиксы в диапазоне 1000-9999 (по умолчанию: 1-9999)")
+        print("  --only-prefixes    : Только добавить/изменить префиксы (без транслитерации)")
+        print("  --only-transliterate: Только транслитерировать (без добавления префиксов)")
         sys.exit(1)
-     
+    
     directory_path = sys.argv[1]
     
     if not directory_path:
         print("Ошибка: путь не может быть пустым")
         sys.exit(1)
     
-    transliterator = FileTransliterator()
+    # Проверяем флаги
+    #flag_ge_1000 = '--ge-1000' in sys.argv
+    only_prefixes = '--only-prefixes' in sys.argv
+    only_transliterate = '--only-transliterate' in sys.argv
+    
+    # Проверяем конфликт флагов
+    if only_prefixes and only_transliterate:
+        print("Ошибка: нельзя одновременно использовать --only-prefixes и --only-transliterate")
+        sys.exit(1)
     
     try:
-        success = transliterator.process_directory(directory_path)
-        if success:
-            print("\n" + "=" * 50)
-            print("Обработка завершена успешно!")
+        if only_prefixes:
+            # Только добавление префиксов
+            print("=" * 70)
+            print("РЕЖИМ: ТОЛЬКО ДОБАВЛЕНИЕ/ИЗМЕНЕНИЕ ПРЕФИКСОВ")
+            print("=" * 70)
+            add_number_prefixes(directory_path, flag_ge_1000)
+            print("\n" + "=" * 70)
+            print("ДОБАВЛЕНИЕ ПРЕФИКСОВ ЗАВЕРШЕНО")
+            print("=" * 70)
+        
+        elif only_transliterate:
+            # Только транслитерация
+            print("=" * 70)
+            print("РЕЖИМ: ТОЛЬКО ТРАНСЛИТЕРАЦИЯ")
+            print("=" * 70)
+            transliterator = FileTransliterator()
+            success = transliterator.process_directory(directory_path)
+            if success:
+                print("\n" + "=" * 70)
+                print("ТРАНСЛИТЕРАЦИЯ ЗАВЕРШЕНА")
+                print("=" * 70)
+            else:
+                print("\n" + "=" * 70)
+                print("ТРАНСЛИТЕРАЦИЯ ПРЕРВАНА ИЗ-ЗА ОШИБОК")
+                print("=" * 70)
+                sys.exit(1)
+        
         else:
-            print("\n" + "=" * 50)
-            print("Обработка прервана из-за ошибок")
-            sys.exit(1)
+            # Полный процесс: транслитерация + добавление префиксов (режим по умолчанию)
+            print("=" * 70)
+            print("РЕЖИМ: ПОЛНАЯ ОБРАБОТКА (ТРАНСЛИТЕРАЦИЯ + ПРЕФИКСЫ)")
+            print("=" * 70)
+            success = process_directory_with_prefixes(directory_path, flag_ge_1000)
+            if success:
+                print("\n" + "=" * 70)
+                print("ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО!")
+                print("=" * 70)
+            else:
+                print("\n" + "=" * 70)
+                print("ОБРАБОТКА ПРЕРВАНА ИЗ-ЗА ОШИБОК")
+                print("=" * 70)
+                sys.exit(1)
+                
     except KeyboardInterrupt:
         print("\n\nОбработка прервана пользователем")
         sys.exit(1)
@@ -628,4 +723,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
