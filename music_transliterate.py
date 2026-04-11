@@ -17,6 +17,34 @@ import random
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Set, List, Any
 
+# безопасная запись в stderr с обработкой ошибок кодировки
+def safe_stderr_write(message: str) -> None:
+    """Безопасная запись в stderr с обработкой ошибок кодировки."""
+    try:
+        sys.stderr.write(message)
+    except UnicodeEncodeError:
+        # Заменяем не-ASCII символы на их кодовые точки (формат \uXXXX)
+        safe_message = message.encode('ascii', errors='backslashreplace').decode('ascii')
+        sys.stderr.write(safe_message)
+    except Exception:
+        # Если и это не помогло, игнорируем
+        pass
+    finally:
+        sys.stderr.flush()
+
+def safe_stdout_write(message: str) -> None:
+    """Безопасная запись в stdout с обработкой ошибок кодировки."""
+    try:
+        sys.stdout.write(message)
+    except UnicodeEncodeError:
+        safe_message = message.encode('ascii', errors='backslashreplace').decode('ascii')
+        sys.stdout.write(safe_message)
+    except Exception:
+        pass
+    finally:
+        sys.stdout.flush()
+
+
 class FileTransliterator:
     def __init__(self):
         # Таблицы транслитерации для разных языков
@@ -84,6 +112,191 @@ class FileTransliterator:
             'TSST',  # Подзаголовок набора
         ]
         
+        # Состояния обработки текущего файла (для подробного логирования при ошибках)
+        self.file_state = {
+            'original': None,           # исходное имя файла (как на диске)
+            'raw_name': None,           # имя без расширения (после splitext)
+            'cleaned_before': None,     # после _clean_decorative_symbols
+            'transliterated': None,     # после транслитерации
+            'sanitized': None,          # после sanitize_filename
+            'final_name': None,         # итоговое имя с расширением
+            'language': None,           # определённый язык
+        }
+
+    def _reset_file_state(self):
+        """Сбрасывает сохранённые состояния перед обработкой нового файла."""
+        for key in self.file_state:
+            self.file_state[key] = None
+
+    def _log_file_state_on_error(self):
+        """Выводит все непустые состояния имени файла в stderr при возникновении ошибки."""
+        sys.stdout.flush()  # гарантируем, что предыдущие успешные сообщения уже выведены
+        safe_stderr_write("\n" + "=" * 70 + "\n")
+        safe_stderr_write("ОШИБКА ПРИ ОБРАБОТКЕ ФАЙЛА. ИСТОРИЯ ИЗМЕНЕНИЙ ИМЕНИ:\n")
+        safe_stderr_write("=" * 70 + "\n")
+        
+        if self.file_state['original'] is not None:
+            safe_stderr_write(f"Исходное имя (с диска)   : {repr(self.file_state['original'])}\n")
+        if self.file_state['raw_name'] is not None:
+            safe_stderr_write(f"Имя без расширения       : {repr(self.file_state['raw_name'])}\n")
+        if self.file_state['cleaned_before'] is not None:
+            safe_stderr_write(f"После очистки (до транслит): {repr(self.file_state['cleaned_before'])}\n")
+        if self.file_state['transliterated'] is not None:
+            safe_stderr_write(f"После транслитерации      : {repr(self.file_state['transliterated'])}\n")
+        if self.file_state['sanitized'] is not None:
+            safe_stderr_write(f"После sanitize            : {repr(self.file_state['sanitized'])}\n")
+        if self.file_state['final_name'] is not None:
+            safe_stderr_write(f"Итоговое имя с расширением: {repr(self.file_state['final_name'])}\n")
+        if self.file_state['language'] is not None:
+            safe_stderr_write(f"Определённый язык         : {self.file_state['language']}\n")
+        
+        safe_stderr_write("=" * 70 + "\n")
+
+    def _add_extra_cyrillic(self, table: Dict[str, str]) -> None:
+        """Добавляет в таблицу транслитерации символы расширенной кириллицы."""
+        extra_cyrillic = {
+            # Азербайджанский, башкирский, казахский, татарский и др.
+            'Ә': 'A', 'ә': 'a',      # A with diaeresis (азерб., башк., каз., тат.)
+            'Ғ': 'G', 'ғ': 'g',      # G with stroke (башк., каз., тадж., тат., уйг.)
+            'Ҙ': 'Z', 'ҙ': 'z',      # Z with descender (башк.)
+            'Ҡ': 'K', 'ҡ': 'k',      # K with descender (башк.)
+            'Ң': 'N', 'ң': 'n',      # N with descender (башк., каз., кирг., тат., уйг.)
+            'Ө': 'O', 'ө': 'o',      # O with bar (башк., бурят., калм., каз., монг., тат., тув., якут.)
+            'Ү': 'U', 'ү': 'u',      # U with straight stroke (башк., бурят., калм., каз., кирг., монг., тат., тув., якут.)
+            'Һ': 'H', 'һ': 'h',      # Shha (башк., бурят., калм., каз., тат., якут.)
+            'Ҷ': 'Ch', 'ҷ': 'ch',    # Che with descender (тадж.)
+            'Ҳ': 'H', 'ҳ': 'h',      # Ha with descender (тадж., узб.)
+            'Қ': 'Q', 'қ': 'q',      # Ka with descender (каз., тадж., узб., уйг.)
+            'Ӯ': 'U', 'ӯ': 'u',      # U with macron (тадж.)
+            'Ғ': 'G', 'ғ': 'g',      # (повтор для единообразия)
+            'Ҷ': 'J', 'ҷ': 'j',      # вариант транслитерации
+            # Белорусский, украинский
+            'Ў': 'U', 'ў': 'u',      # Short U (белорус., узб.)
+            'І': 'I', 'і': 'i',      # Belarusian/Ukrainian I (уже есть в ukrainian_table)
+            'Ґ': 'G', 'ґ': 'g',      # G with upturn (укр.)
+            'Є': 'Ye', 'є': 'ye',    # Ukrainian Ye
+            'Ї': 'Yi', 'ї': 'yi',    # Ukrainian Yi
+            # Дополнительные буквы с диакритикой, встречающиеся в именах
+            'Ӂ': 'Zh', 'ӂ': 'zh',    # Zhe with breve (молд., гагауз.)
+            'Ӌ': 'Ch', 'ӌ': 'ch',    # Che with descender (хакас.)
+            'Ӑ': 'A', 'ӑ': 'a',      # A with breve (чуваш.)
+            'Ӗ': 'E', 'ӗ': 'e',      # E with breve (чуваш.)
+            'Ҫ': 'S', 'ҫ': 's',      # Es with descender (башк., чуваш.)
+            'Ҭ': 'T', 'ҭ': 't',      # Te with descender (абхаз.)
+            'Ӳ': 'U', 'ӳ': 'u',      # U with double acute (чуваш.)
+            'Ӱ': 'U', 'ӱ': 'u',      # U with diaeresis (алт., хакас., марийск.)
+            'Ӹ': 'Y', 'ӹ': 'y',      # Yeru with diaeresis (марийск.)
+            'Ӓ': 'A', 'ӓ': 'a',      # A with diaeresis (марийск., саам.)
+            'Ӛ': 'E', 'ӛ': 'e',      # E with diaeresis (ненецк.)
+            'Ӝ': 'Zh', 'ӝ': 'zh',    # Zhe with diaeresis (удм.)
+            'Ӟ': 'Dz', 'ӟ': 'dz',    # Ze with diaeresis (удм.)
+            'Ӥ': 'I', 'ӥ': 'i',      # I with diaeresis (удм.)
+            'Ӧ': 'O', 'ӧ': 'o',      # O with diaeresis (коми, марийск., удм.)
+            'Ӫ': 'O', 'ӫ': 'o',      # O with diaeresis and macron (эвенк.)
+            'Ӭ': 'E', 'ӭ': 'e',      # E with diaeresis and macron (эвенк.)
+            'Ӵ': 'Ch', 'ӵ': 'ch',    # Che with diaeresis (удм.)
+            'Ҕ': 'G', 'ҕ': 'g',      # Ghe with middle hook (абхазский, якутский)
+            'Ӄ': 'K', 'ӄ': 'k',      # Ka with vertical stroke (чукотский, корякский)
+        }
+        table.update(extra_cyrillic)
+
+    def _add_decorative_latin(self, table: Dict[str, str]) -> None:
+        """Добавляет в таблицу транслитерации декоративные латинские символы (Small Caps, коптские буквы и др.)."""
+        decorative = {
+            # Small Caps (U+1D00 – U+1D7F, выборочно)
+            'ᴀ': 'A', 'ʙ': 'B', 'ᴄ': 'C', 'ᴅ': 'D', 'ᴇ': 'E',
+            'ꜰ': 'F', 'ɢ': 'G', 'ʜ': 'H', 'ɪ': 'I', 'ᴊ': 'J',
+            'ᴋ': 'K', 'ʟ': 'L', 'ᴍ': 'M', 'ɴ': 'N', 'ᴏ': 'O',
+            'ᴘ': 'P', 'ꞯ': 'Q', 'ʀ': 'R', 'ꜱ': 'S', 'ᴛ': 'T',
+            'ᴜ': 'U', 'ᴠ': 'V', 'ᴡ': 'W', 'x': 'X', 'ʏ': 'Y',
+            'ᴢ': 'Z',
+            # Latin Letter Yr (стилизованная R)
+            'Ʀ': 'R',
+            # Коптские буквы (часто используются для стилизации)
+            'Ⲁ': 'A', 'ⲁ': 'a',
+            'Ⲃ': 'B', 'ⲃ': 'b',
+            'Ⲅ': 'G', 'ⲅ': 'g',
+            'Ⲇ': 'D', 'ⲇ': 'd',
+            'Ⲉ': 'E', 'ⲉ': 'e',
+            'Ⲋ': 'S', 'ⲋ': 's',
+            'Ⲍ': 'Z', 'ⲍ': 'z',
+            'Ⲏ': 'I', 'ⲏ': 'i',
+            'Ⲑ': 'Th', 'ⲑ': 'th',
+            'Ⲓ': 'I', 'ⲓ': 'i',
+            'Ⲕ': 'K', 'ⲕ': 'k',
+            'Ⲗ': 'L', 'ⲗ': 'l',
+            'Ⲙ': 'M', 'ⲙ': 'm',
+            'Ⲛ': 'N', 'ⲛ': 'n',
+            'Ⲝ': 'X', 'ⲝ': 'x',
+            'Ⲟ': 'O', 'ⲟ': 'o',
+            'Ⲡ': 'P', 'ⲡ': 'p',
+            'Ⲣ': 'R', 'ⲣ': 'r',
+            'Ⲥ': 'S', 'ⲥ': 's',
+            'Ⲧ': 'T', 'ⲧ': 't',
+            'Ⲩ': 'U', 'ⲩ': 'u',
+            'Ⲫ': 'Ph', 'ⲫ': 'ph',
+            'Ⲭ': 'Kh', 'ⲭ': 'kh',
+            'Ⲯ': 'Ps', 'ⲯ': 'ps',
+            'Ⲱ': 'O', 'ⲱ': 'o',
+            'Ⲳ': 'Sh', 'ⲳ': 'sh',
+            'Ⲵ': 'F', 'ⲵ': 'f',
+            'Ⲷ': 'Kh', 'ⲷ': 'kh',
+            'Ⲹ': 'H', 'ⲹ': 'h',
+            'Ⲻ': 'Ch', 'ⲻ': 'ch',
+            'Ⲽ': 'Ti', 'ⲽ': 'ti',
+            # Декоративные буквы из других письменностей (похожие на латиницу)
+            # Канадское слоговое письмо и чероки
+            'ᗰ': 'M',   # U+15F0
+            'Ꮌ': 'M',   # U+13BC (Cherokee)
+            'Ꮗ': 'W',   # U+13C7 (Cherokee)
+            'Ꭵ': 'i',   # U+13A5
+            'Ꮢ': 'R',   # U+13D2
+            # Грузинский (Mkhedruli) – визуально похожие на латиницу
+            'ყ': 'y',   # U+10E7
+            'მ': 'm',   # U+10DB
+            'ნ': 'n',   # U+10DC
+            'ა': 'a',   # U+10D0
+            'ბ': 'b',   # U+10D1
+            'გ': 'g',   # U+10D2
+            'დ': 'd',   # U+10D3
+            'ე': 'e',   # U+10D4
+            'ვ': 'v',   # U+10D5
+            'ზ': 'z',   # U+10D6
+            'თ': 't',   # U+10D7
+            'ი': 'i',   # U+10D8
+            'კ': 'k',   # U+10D9
+            'ლ': 'l',   # U+10DA
+            'ო': 'o',   # U+10DD
+            'პ': 'p',   # U+10DE
+            'ჟ': 'zh',  # U+10DF
+            'რ': 'r',   # U+10E0
+            'ს': 's',   # U+10E1
+            'ტ': 't',   # U+10E2
+            'უ': 'u',   # U+10E3
+            'ფ': 'p',   # U+10E4
+            'ქ': 'k',   # U+10E5
+            'ღ': 'gh',  # U+10E6
+            'შ': 'sh',  # U+10E8
+            'ჩ': 'ch',  # U+10E9
+            'ც': 'ts',  # U+10EA
+            'ძ': 'dz',  # U+10EB
+            'წ': 'ts',  # U+10EC
+            'ჭ': 'ch',  # U+10ED
+            'ხ': 'kh',  # U+10EE
+            'ჯ': 'j',   # U+10EF
+            'ჰ': 'h',   # U+10F0
+            # Греческие буквы (стилистические)
+            'ϐ': 'b',   # U+03D0 (Greek beta symbol)
+            # Тайские буквы (стилизация)
+            'ค': 'a',   # U+0E04 (kho khwai, визуально 'a')
+            # Гурмукхи (пенджаби)
+            'ਮ': 'm',   # U+0A2E  # indents are ok here
+            # Other
+            'ʍ': 'w',   # U+028D LATIN SMALL LETTER TURNED W
+            'ნ': 'n',   # U+10DC (уже добавлен выше, но оставлен для ясности)
+        }
+        table.update(decorative)
+
     def _create_transliteration_tables(self) -> Dict[str, Dict[str, str]]:
         """Создает таблицы транслитерации для всех языков"""
         
@@ -410,6 +623,14 @@ class FileTransliterator:
             'ѷ': 'i',     # CYRILLIC SMALL LETTER IZHITSA WITH DOUBLE GRAVE ACCENT (U+0477) - старославянский
         }
         
+        # Добавляем расширенную кириллицу в русскую и европейскую таблицы
+        self._add_extra_cyrillic(russian_table)
+        self._add_extra_cyrillic(european_table)
+
+        # Добавляем декоративные латинские и коптские символы в русскую (встречено in the wild) и европейскую таблицы
+        self._add_decorative_latin(russian_table)
+        self._add_decorative_latin(european_table)
+        
         # Добавляем общие символы пунктуации ко всем таблицам
         # Все кавычки заменяем строго на апостроф, звездочки на подчеркивание
         common_punctuation = {
@@ -445,6 +666,9 @@ class FileTransliterator:
         
         # Для европейской таблицы добавляем еще больше символов
         european_table.update(common_punctuation)
+
+        # Добавляем базовую кириллицу из русской таблицы в европейскую (встречается смесь)
+        european_table.update(russian_table)
         
         return {
             'russian': russian_table,
@@ -455,6 +679,187 @@ class FileTransliterator:
             'european': european_table
         }
     
+    # Метод для удаления декоративных Unicode-символов
+    def _clean_decorative_symbols(self, text: str, strict: bool = False) -> str:
+        """
+        Удаляет декоративные и нетекстовые символы, оставляя только буквы, цифры, пробелы и базовую пунктуацию.
+        
+        Параметры:
+            text (str): исходная строка
+            strict (bool): если True, оставляет только ASCII-символы (буквы, цифры, ограниченная пунктуация)
+        
+        Возвращает:
+            str: очищенная строка
+        """
+        # 1. Нормализация Unicode (NFKC) – преобразует лигатуры, надстрочные символы, декоративные варианты в обычные ASCII-аналоги
+        #    Например: ﬁ -> fi, ① -> 1, ℌ -> H, Ｃ -> C
+        text = unicodedata.normalize('NFKC', text)
+        
+        # 2. Замена нелатинских цифр (арабских, тайских, деванагари и т.д.) на ASCII-цифры
+        #    Используем unicodedata.decimal() для получения числового значения.
+        digit_replaced_chars = []
+        for ch in text:
+            try:
+                # Пытаемся получить десятичное значение символа (работает для всех цифровых символов Unicode)
+                decimal_value = unicodedata.decimal(ch)
+                # Заменяем на соответствующую ASCII-цифру
+                digit_replaced_chars.append(str(decimal_value))
+            except ValueError:
+                # Не является десятичной цифрой – оставляем как есть
+                digit_replaced_chars.append(ch)
+        text = ''.join(digit_replaced_chars)
+        
+        # 3. Удаление комбинирующих диакритических знаков (акцентов, огласовок и т.д.)
+        #    Нормализуем в NFD (декомпозиция) – все составные символы разбиваются на базовый символ + combining marks
+        text = unicodedata.normalize('NFD', text)
+        #    Удаляем все символы категории Mn (Non-spacing Mark) и Mc (Spacing Combining Mark)
+        text = ''.join(ch for ch in text if unicodedata.category(ch) not in ('Mn', 'Mc'))
+        #    После удаления диакритик можно снова нормализовать в NFC для компактности (опционально)
+        text = unicodedata.normalize('NFC', text)
+        
+        # Определяем разрешённые категории символов (по первой букве категории Unicode)
+        # L - буквы, N - цифры, Zs - пробелы, P - пунктуация, S - символы (валюта и т.п.)
+        allowed_categories = {'L', 'N', 'Zs', 'P', 'S'} if not strict else {'L', 'N', 'Zs'}
+        
+        # Символы пунктуации, разрешённые в строгом режиме (ASCII)
+        allowed_punctuation = set('.,!?;:\'\"- _()[]{}#$')
+        
+        # Чёрный список конкретных кодовых точек (невидимые, управляющие, мешающие)
+        forbidden_codepoints = {
+            # Невидимые и управляющие
+            0x200B,  # ZERO WIDTH SPACE
+            0x200C,  # ZERO WIDTH NON-JOINER
+            0x200D,  # ZERO WIDTH JOINER
+            0x2060,  # WORD JOINER
+            0x2061,  # FUNCTION APPLICATION
+            0x2062,  # INVISIBLE TIMES
+            0x2063,  # INVISIBLE SEPARATOR
+            0x2064,  # INVISIBLE PLUS
+            0x2065,  # INVISIBLE ASTERISK
+            0x2066,  # LEFT-TO-RIGHT ISOLATE
+            0x2067,  # RIGHT-TO-LEFT ISOLATE
+            0x2068,  # FIRST STRONG ISOLATE
+            0x2069,  # POP DIRECTIONAL ISOLATE
+            0xFEFF,  # ZERO WIDTH NO-BREAK SPACE (BOM)
+            0x00AD,  # SOFT HYPHEN (невидимый дефис)
+            0x034F,  # COMBINING GRAPHEME JOINER
+            0x061C,  # ARABIC LETTER MARK
+            0x115F,  # HANGUL CHOSEONG FILLER
+            0x1160,  # HANGUL JUNGSEONG FILLER
+            0x17B4,  # KHMER VOWEL INHERENT AQ
+            0x17B5,  # KHMER VOWEL INHERENT AA
+            0x180E,  # MONGOLIAN VOWEL SEPARATOR
+            0x200E,  # LEFT-TO-RIGHT MARK
+            0x200F,  # RIGHT-TO-LEFT MARK
+            0x202A,  # LEFT-TO-RIGHT EMBEDDING
+            0x202B,  # RIGHT-TO-LEFT EMBEDDING
+            0x202C,  # POP DIRECTIONAL FORMATTING
+            0x202D,  # LEFT-TO-RIGHT OVERRIDE
+            0x202E,  # RIGHT-TO-LEFT OVERRIDE
+            # Декоративные и нежелательные символы
+            0x00B0,  # DEGREE SIGN (°)
+            0x00B4,  # ACUTE ACCENT (´) – обычно удаляется, но для надёжности
+            0x00B8,  # CEDILLA (¸)
+            0x00AF,  # MACRON (¯)
+            0x00B7,  # MIDDLE DOT (·)
+            0x2206,  # INCREMENT / DELTA (∆) – часто используется как символ "изменение"
+            0x2211,  # N-ARY SUMMATION (∑)
+            0x221E,  # INFINITY (∞)
+            0x2248,  # ALMOST EQUAL TO (≈)
+            0x2260,  # NOT EQUAL TO (≠)
+            0x2264,  # LESS-THAN OR EQUAL TO (≤)
+            0x2265,  # GREATER-THAN OR EQUAL TO (≥)
+            # Декоративные круги, точки и геометрические фигуры
+            0x25CF,  # BLACK CIRCLE (●)
+            0x25CB,  # WHITE CIRCLE (○)
+            0x25CE,  # BULLSEYE (◎)
+            0x25A0,  # BLACK SQUARE (■)
+            0x25A1,  # WHITE SQUARE (□)
+            0x25B2,  # BLACK UP-POINTING TRIANGLE (▲)
+            0x25B6,  # BLACK RIGHT-POINTING TRIANGLE (▶)
+            0x25C0,  # BLACK LEFT-POINTING TRIANGLE (◀)
+            0x25BC,  # BLACK DOWN-POINTING TRIANGLE (▼)            
+            0xFFFD,  # REPLACEMENT CHARACTER (�) – появляется при ошибках декодирования
+            # Можно добавить другие по мере обнаружения
+        }
+        
+        # Диапазоны нежелательных декоративных символов (могут быть добавлены блоком)
+        forbidden_ranges = [
+            (0x02B0, 0x02FF),   # Spacing Modifier Letters (например, ˙ U+02D9)
+            (0x0370, 0x03FF),   # Greek and Coptic (включает греческую точку · U+0387)
+            (0x1F000, 0x1F02F), # Mahjong Tiles
+            (0x1F0A0, 0x1F0FF), # Playing Cards
+            (0x1F100, 0x1F1FF), # Enclosed Alphanumeric Supplement
+            (0x1F200, 0x1F2FF), # Enclosed Ideographic Supplement
+            (0x1F300, 0x1F5FF), # Miscellaneous Symbols and Pictographs (эмодзи)
+            (0x1F600, 0x1F64F), # Emoticons
+            (0x1F680, 0x1F6FF), # Transport and Map Symbols
+            (0x1F700, 0x1F77F), # Alchemical Symbols
+            (0x1F780, 0x1F7FF), # Geometric Shapes Extended
+            (0x1F800, 0x1F8FF), # Supplemental Arrows-C
+            (0x1F900, 0x1F9FF), # Supplemental Symbols and Pictographs
+            (0x1FA00, 0x1FA6F), # Chess Symbols
+            (0x1FA70, 0x1FAFF), # Symbols and Pictographs Extended-A
+            (0x2600, 0x26FF),   # Miscellaneous Symbols
+            (0x2700, 0x27BF),   # Dingbats
+            (0xFE00, 0xFE0F),   # Variation Selectors
+            (0x0600, 0x06FF),   # Arabic (включает декоративный ۩ U+06E9)
+            (0x0E00, 0x0E7F),   # Thai (включает тайскую цифру ๑ U+0E51, но она уже заменена на ASCII-цифру ранее)
+            (0x2000, 0x206F),   # General Punctuation (включает BULLET • U+2022)
+            (0x2E00, 0x2E7F),   # Supplemental Punctuation
+            (0x3000, 0x303F),   # CJK Symbols and Punctuation
+            (0x3200, 0x32FF),   # Enclosed CJK Letters and Months
+            (0x3300, 0x33FF),   # CJK Compatibility
+            (0xFF00, 0xFFEF),   # Halfwidth and Fullwidth Forms
+        ]
+        
+        # Категории Unicode, которые всегда запрещены (даже если их первая буква совпадает с разрешёнными)
+        forbidden_categories = {'Cc', 'Cf', 'Co', 'Cn', 'Cs'}
+        
+        result_chars = []
+        for ch in text:
+            cp = ord(ch)
+            
+            # Проверка на вхождение в запрещённые диапазоны
+            if any(start <= cp <= end for start, end in forbidden_ranges):
+                continue
+            
+            # Проверка на вхождение в чёрный список конкретных точек
+            if cp in forbidden_codepoints:
+                continue
+            
+            # Проверка категории
+            cat = unicodedata.category(ch)
+            if cat in forbidden_categories:
+                continue
+            
+            # Фильтрация по разрешённым категориям
+            cat_prefix = cat[0]  # первая буква категории
+            if cat_prefix not in allowed_categories:
+                continue
+            
+            # В строгом режиме дополнительно проверяем, что символ ASCII (<= 127) и/или входит в разрешённую пунктуацию
+            if strict:
+                if cp <= 127:
+                    if cat_prefix == 'P' and ch not in allowed_punctuation:
+                        continue
+                    # Для остальных ASCII-символов (L, N, Zs) пропускаем
+                else:
+                    # Не-ASCII символы в строгом режиме запрещены
+                    continue
+            
+            result_chars.append(ch)
+        
+        # Собираем результат
+        cleaned = ''.join(result_chars)
+        
+        # 4. Нормализация пробельных символов: заменяем любые пробельные последовательности (включая неразрывные) на одиночный пробел
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        # Удаляем пробелы в начале и конце
+        cleaned = cleaned.strip()
+        
+        return cleaned
+
     def sanitize_filename(self, filename: str) -> str:
         """Очищает имя файла от недопустимых символов"""
         result_chars = []
@@ -471,19 +876,6 @@ class FileTransliterator:
         
         result = ''.join(result_chars)
         
-        # Удаляем начальные и конечные пробелы и точки (проблема для Windows)
-        result = result.strip('. ')
-        
-        # Заменяем множественные подчеркивания на одно
-        result = re.sub(r'_+', '_', result)
-        
-        # Удаляем начальные и конечные подчеркивания
-        result = result.strip('_')
-        
-        # Если после очистки имя файла пустое, возвращаем "unnamed"
-        if not result:
-            return "unnamed"
-            
         return result
     
     def detect_language(self, text: str) -> Optional[str]:
@@ -504,8 +896,9 @@ class FileTransliterator:
         # Возвращаем язык с максимальным количеством специфических символов
         return max(language_scores.items(), key=lambda x: x[1])[0]
     
-    def transliterate_text(self, text: str, language: Optional[str] = None, check_ascii: bool = True) -> Optional[str]:
-        """Транслитерирует текст с учетом выбранного языка"""
+    def transliterate_text(self, text: str, language: Optional[str] = None, check_ascii: bool = True, filename: str = "") -> Optional[str]:
+        """Транслитерирует текст с учетом выбранного языка.
+        filename - имя файла для вывода в сообщениях об ошибках."""
         if not language:
             language = self.detect_language(text)
             if not language:
@@ -518,6 +911,9 @@ class FileTransliterator:
         for char in text:
             if char in transliteration_table:
                 result_chars.append(transliteration_table[char])
+            elif self._is_cjk(char):
+                # Заменяем китайские, японские, корейские иероглифы на #
+                result_chars.append('#')
             elif self._should_transliterate(char):
                 # Пытаемся нормализовать символ
                 try:
@@ -538,13 +934,30 @@ class FileTransliterator:
         
         result = ''.join(result_chars)
         
+        # Сохраняем результат транслитерации в состояние (если это имя файла)
+        if filename:
+            self.file_state['transliterated'] = result
+        
         # Проверка на не-ASCII символы (только для имен файлов)
         if check_ascii:
             has_non_ascii, highlighted = self.has_non_ascii(result)
             if has_non_ascii:
-                print(f"Ошибка: после транслитерации остались не-ASCII символы:")
-                print(f"Исходный текст: {text}")
-                print(f"Транслитерированный: {highlighted}")
+                file_info = f" (файл: {filename})" if filename else ""
+                # Безопасный вывод в stderr с заменой проблемных символов
+                sys.stdout.flush()
+                safe_stderr_write(f"Ошибка: после транслитерации остались не-ASCII символы{file_info}:\n")
+                safe_stderr_write(f"Исходный текст: {repr(text)}\n")
+                # Пытаемся записать highlighted, но если не получается, заменяем проблемные символы
+                try:
+                    safe_stderr_write(f"Транслитерированный: {repr(result)}\n")
+                except Exception:
+                    safe_highlighted = result.encode('ascii', errors='backslashreplace').decode('ascii')
+                    safe_stderr_write(f"Транслитерированный (с заменой): {safe_highlighted}\n")
+                # Дополнительно показываем, какие именно символы не-ASCII
+                non_ascii_chars = [ch for ch in result if ord(ch) > 127]
+                safe_stderr_write(f"Оставшиеся не-ASCII символы: {repr(''.join(non_ascii_chars))}\n")
+                # Логируем состояние файла при ошибке
+                self._log_file_state_on_error()
                 return None
         
         return result
@@ -746,6 +1159,36 @@ class FileTransliterator:
         
         return False
     
+    def _is_cjk(self, char: str) -> bool:
+        """Проверяет, является ли символ иероглифом CJK (китайским, японским, корейским)."""
+        code = ord(char)
+        # Основные диапазоны CJK:
+        # 0x4E00-0x9FFF   CJK Unified Ideographs (основные китайские и японские иероглифы)
+        # 0x3400-0x4DBF   CJK Unified Ideographs Extension A
+        # 0x20000-0x2A6DF CJK Unified Ideographs Extension B (редко, но для полноты)
+        # 0xAC00-0xD7AF   Hangul Syllables (корейские слоговые блоки)
+        # 0x1100-0x11FF   Hangul Jamo (составные части корейских букв)
+        # 0x3130-0x318F   Hangul Compatibility Jamo
+        # 0xA960-0xA97F   Hangul Jamo Extended-A
+        # 0xD7B0-0xD7FF   Hangul Jamo Extended-B
+        # Также добавим Hiragana/Katakana (японские слоговые азбуки)
+        # 0x3040-0x309F   Hiragana
+        # 0x30A0-0x30FF   Katakana
+        # 0xFF65-0xFF9F   Halfwidth Katakana
+        return (
+            (0x4E00 <= code <= 0x9FFF) or
+            (0x3400 <= code <= 0x4DBF) or
+            (0x20000 <= code <= 0x2A6DF) or
+            (0xAC00 <= code <= 0xD7AF) or
+            (0x1100 <= code <= 0x11FF) or
+            (0x3130 <= code <= 0x318F) or
+            (0xA960 <= code <= 0xA97F) or
+            (0xD7B0 <= code <= 0xD7FF) or
+            (0x3040 <= code <= 0x309F) or   # Hiragana
+            (0x30A0 <= code <= 0x30FF) or   # Katakana
+            (0xFF65 <= code <= 0xFF9F)      # Halfwidth Katakana
+        )
+    
     def has_non_ascii(self, text: str) -> Tuple[bool, str]:
         """Проверяет наличие не-ASCII символов и возвращает подсвеченную строку"""
         has_non_ascii = False
@@ -762,24 +1205,60 @@ class FileTransliterator:
     
     def process_filename(self, filename: str) -> Tuple[Optional[str], Optional[str]]:
         """Обрабатывает имя файла: отделяет расширение, транслитерирует имя"""
-        # Разделяем имя файла и расширение
-        name, ext = os.path.splitext(filename)
+        # Сбрасываем состояние и сохраняем исходное имя файла
+        self._reset_file_state()
+        self.file_state['original'] = filename
         
-        # Определяем язык
-        language = self.detect_language(name)
-        if not language:
-            language = 'european'
+        try:
+            # Разделяем имя файла и расширение
+            name, ext = os.path.splitext(filename)
+            self.file_state['raw_name'] = name
+            
+            # Определяем язык
+            language = self.detect_language(name)
+            if not language:
+                language = 'european'
+            self.file_state['language'] = language
+            
+            # Предварительно очищаем от декоративных символов, чтобы они не мешали транслитерации
+            cleaned_before = self._clean_decorative_symbols(name)
+            self.file_state['cleaned_before'] = cleaned_before
+            
+            # Транслитерируем имя с проверкой на не-ASCII
+            # передаём имя файла для вывода в ошибках
+            transliterated_name = self.transliterate_text(cleaned_before, language, check_ascii=True, filename=filename)
+            # transliterate_text уже обновляет file_state['transliterated'] и вызывает _log_file_state_on_error при ошибке
+            
+            if transliterated_name is None:
+                # Ошибка уже залогирована в transliterate_text, просто возвращаем None
+                return None, None
+            
+            # Очищаем от недопустимых символов в имени файла
+            sanitized_name = self.sanitize_filename(transliterated_name)
+            self.file_state['sanitized'] = sanitized_name
+            
+            # Удаляем декоративные символы (повторно, для страховки)
+            cleaned_name = self._clean_decorative_symbols(sanitized_name)
+            
+            # Проверка на пустое имя после очистки
+            if not cleaned_name or cleaned_name.isspace():
+                sys.stdout.flush()
+                safe_stderr_write(f"Ошибка: после удаления декоративных символов имя файла стало пустым (исходный файл: {filename})\n")
+                self._log_file_state_on_error()
+                return None, None
+            
+            final_name = cleaned_name + ext
+            self.file_state['final_name'] = final_name
+            
+            return final_name, language
         
-        # Транслитерируем имя с проверкой на не-ASCII
-        transliterated_name = self.transliterate_text(name, language, check_ascii=True)
-        
-        if transliterated_name is None:
+        except Exception as e:
+            sys.stdout.flush()
+            safe_stderr_write(f"  ✗ Исключение при обработке имени файла '{filename}': {e}\n")
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            self._log_file_state_on_error()
             return None, None
-        
-        # Очищаем от недопустимых символов в имени файла
-        sanitized_name = self.sanitize_filename(transliterated_name)
-        
-        return sanitized_name + ext, language
     
     def _get_tag_text(self, tag) -> Optional[str]:
         """Безопасно получает текстовое значение тега"""
@@ -813,9 +1292,9 @@ class FileTransliterator:
             from mutagen import MutagenError
             from mutagen.id3 import TextFrame, COMM, TXXX, USLT, APIC
         except ImportError:
-            print(f"  Предупреждение: библиотека mutagen не установлена. "
-                  f"ID3-теги файла '{file_path.name}' не будут обработаны.")
-            print("  Установите mutagen: pip install mutagen")
+            safe_stdout_write(f"  Предупреждение: библиотека mutagen не установлена. "
+                  f"ID3-теги файла '{file_path.name}' не будут обработаны.\n")
+            safe_stdout_write("  Установите mutagen: pip install mutagen\n")
             return False
         
         try:
@@ -830,7 +1309,7 @@ class FileTransliterator:
             
             # Получаем все теги перед обработкой
             all_tags = list(audio.tags.keys())
-            print(f"  Найдено тегов в файле: {len(all_tags)}")
+            safe_stdout_write(f"  Найдено тегов в файле: {len(all_tags)}\n")
             
             # Транслитерируем указанные ID3 теги
             for tag_name in self.id3_text_tags_to_transliterate:
@@ -841,8 +1320,9 @@ class FileTransliterator:
                         
                         if tag_value:
                             # Транслитерируем значение тега (без проверки на ASCII)
+                            # передаём имя файла для вывода в ошибках
                             transliterated_value = self.transliterate_text(
-                                tag_value, language, check_ascii=False
+                                tag_value, language, check_ascii=False, filename=file_path.name
                             )
                             
                             if transliterated_value and transliterated_value != tag_value:
@@ -852,9 +1332,9 @@ class FileTransliterator:
                                 # Обновляем текст тега
                                 tag.text = [transliterated_value]
                                 tags_modified = True
-                                print(f"    Обновлен тег {tag_name}: {tag_value[:50]}... -> {transliterated_value[:50]}...")
+                                safe_stdout_write(f"    Обновлен тег {tag_name}: {tag_value[:50]}... -> {transliterated_value[:50]}...\n")
                     except Exception as e:
-                        print(f"  Ошибка при обработке тега {tag_name}: {e}")
+                        safe_stderr_write(f"  Ошибка при обработке тега {tag_name} в файле '{file_path.name}': {e}\n")
                         continue
             
             # Также транслитерируем COMM теги (комментарии)
@@ -872,16 +1352,17 @@ class FileTransliterator:
                                 comment_text = str(tag.text)
                             
                             if comment_text:
+                                # Передаём имя файла для вывода в ошибках
                                 transliterated_text = self.transliterate_text(
-                                    comment_text, language, check_ascii=False
+                                    comment_text, language, check_ascii=False, filename=file_path.name
                                 )
                                 if transliterated_text and transliterated_text != comment_text:
                                     # Обновляем текст комментария, сохраняя все остальные атрибуты
                                     tag.text = [transliterated_text]
                                     tags_modified = True
-                                    print(f"    Обновлен комментарий: {comment_text[:50]}... -> {transliterated_text[:50]}...")
+                                    safe_stdout_write(f"    Обновлен комментарий: {comment_text[:50]}... -> {transliterated_text[:50]}...\n")
                 except Exception as e:
-                    print(f"  Ошибка при обработке комментария {tag_name}: {e}")
+                    safe_stderr_write(f"  Ошибка при обработке комментария {tag_name} в файле '{file_path.name}': {e}\n")
                     continue
             
             # Обработка пользовательских тегов (TXXX)
@@ -898,17 +1379,18 @@ class FileTransliterator:
                                 txxx_text = str(tag.text)
                             
                             if txxx_text:
+                                # Передаём имя файла для вывода в ошибках
                                 transliterated_text = self.transliterate_text(
-                                    txxx_text, language, check_ascii=False
+                                    txxx_text, language, check_ascii=False, filename=file_path.name
                                 )
                                 if transliterated_text and transliterated_text != txxx_text:
                                     # Обновляем текст тега, сохраняя описание и кодировку
                                     tag.text = [transliterated_text]
                                     tags_modified = True
                                     desc = tag.desc if hasattr(tag, 'desc') else ''
-                                    print(f"    Обновлен пользовательский тег '{desc}': {txxx_text[:50]}... -> {transliterated_text[:50]}...")
+                                    safe_stdout_write(f"    Обновлен пользовательский тег '{desc}': {txxx_text[:50]}... -> {transliterated_text[:50]}...\n")
                 except Exception as e:
-                    print(f"  Ошибка при обработке пользовательского тега {tag_name}: {e}")
+                    safe_stderr_write(f"  Ошибка при обработке пользовательского тега {tag_name} в файле '{file_path.name}': {e}\n")
                     continue
             
             # Также обрабатываем теги текстов песен (USLT)
@@ -921,38 +1403,39 @@ class FileTransliterator:
                         if hasattr(tag, 'text'):
                             uslt_text = tag.text
                             if uslt_text:
+                                # Передаём имя файла для вывода в ошибках
                                 transliterated_text = self.transliterate_text(
-                                    uslt_text, language, check_ascii=False
+                                    uslt_text, language, check_ascii=False, filename=file_path.name
                                 )
                                 if transliterated_text and transliterated_text != uslt_text:
                                     # Обновляем текст песни
                                     tag.text = transliterated_text
                                     tags_modified = True
-                                    print(f"    Обновлен текст песни: {len(uslt_text)} символов -> {len(transliterated_text)} символов")
+                                    safe_stdout_write(f"    Обновлен текст песни: {len(uslt_text)} символов -> {len(transliterated_text)} символов\n")
                 except Exception as e:
-                    print(f"  Ошибка при обработке текста песни {tag_name}: {e}")
+                    safe_stderr_write(f"  Ошибка при обработке текста песни {tag_name} в файле '{file_path.name}': {e}\n")
                     continue
             
             # Сохраняем изменения, если они были
             if tags_modified:
                 try:
                     audio.save()
-                    print(f"  ✓ ID3-теги файла '{file_path.name}' транслитерированы и сохранены")
+                    safe_stdout_write(f"  ✓ ID3-теги файла '{file_path.name}' транслитерированы и сохранены\n")
                     return True
                 except Exception as e:
-                    print(f"  ✗ Ошибка при сохранении тегов: {e}")
+                    safe_stderr_write(f"  ✗ Ошибка при сохранении тегов файла '{file_path.name}': {e}\n")
                     return False
             else:
-                print(f"  - ID3-теги файла '{file_path.name}' не требуют изменений")
+                safe_stdout_write(f"  - ID3-теги файла '{file_path.name}' не требуют изменений\n")
                 return True
                 
         except (ID3NoHeaderError, MutagenError) as e:
-            print(f"  ! Ошибка при чтении ID3-тегов файла '{file_path.name}': {e}")
+            safe_stderr_write(f"  ! Ошибка при чтении ID3-тегов файла '{file_path.name}': {e}\n")
             return False
         except Exception as e:
-            print(f"  ! Неожиданная ошибка при обработке ID3-тегов файла '{file_path.name}': {e}")
+            safe_stderr_write(f"  ! Неожиданная ошибка при обработке ID3-тегов файла '{file_path.name}': {e}\n")
             import traceback
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
             return False
     
     def process_directory(self, directory_path: str) -> bool:
@@ -960,82 +1443,92 @@ class FileTransliterator:
         path = Path(directory_path)
         
         if not path.exists():
-            print(f"Ошибка: путь '{directory_path}' не существует")
+            safe_stderr_write(f"Ошибка: путь '{directory_path}' не существует\n")
             return False
         
         if not path.is_dir():
-            print(f"Ошибка: '{directory_path}' не является директорией")
+            safe_stderr_write(f"Ошибка: '{directory_path}' не является директорией\n")
             return False
         
         # Собираем все файлы в директории
         files = [f for f in path.iterdir() if f.is_file()]
         
         if not files:
-            print(f"Директория '{directory_path}' не содержит файлов")
+            safe_stdout_write(f"Директория '{directory_path}' не содержит файлов\n")
             return True
         
-        print(f"Найдено {len(files)} файлов для обработки\n")
+        safe_stdout_write(f"Найдено {len(files)} файлов для обработки\n\n")
         
         # Сначала проверяем все файлы на наличие проблем
         processed_files = {}
         
         for file_path in files:
             original_name = file_path.name
-            print(f"Обработка файла: {original_name}")
+            safe_stdout_write(f"Обработка файла: {original_name}\n")
+            sys.stdout.flush()
             
-            result = self.process_filename(original_name)
+            try:
+                result = self.process_filename(original_name)
+            except Exception as e:
+                sys.stdout.flush()
+                safe_stderr_write(f"  ✗ Непредвиденная ошибка при обработке имени файла '{original_name}': {e}\n")
+                self._log_file_state_on_error()
+                return False
             
             if result[0] is None:
-                print(f"  ✗ Ошибка при обработке имени файла\n")
+                # Ошибка уже залогирована в process_filename/transliterate_text
                 return False
             
             new_name, language = result
             
-            print(f"  Определен язык: {language if language else 'не определен'}")
-            print(f"  Новое имя: {new_name}")
+            safe_stdout_write(f"  Определен язык: {language if language else 'не определен'}\n")
+            safe_stdout_write(f"  Новое имя: {new_name}\n")
             
             # Проверяем на конфликт имен в пределах текущей обработки
             if new_name in [name for name, _, _ in processed_files.values()]:
-                print(f"  ✗ Ошибка: конфликт имен при переименовании:")
-                print(f"  Файл '{original_name}' должен быть переименован в '{new_name}'")
-                print(f"  Но файл с таким именем уже будет создан из другого исходного файла\n")
+                sys.stdout.flush()
+                safe_stderr_write(f"  ✗ Ошибка: конфликт имен при переименовании:\n")
+                safe_stderr_write(f"  Файл '{original_name}' должен быть переименован в '{new_name}'\n")
+                safe_stderr_write(f"  Но файл с таким именем уже будет создан из другого исходного файла\n")
                 return False
             
             # Проверяем, существует ли уже файл с таким именем
             new_path = file_path.parent / new_name
             if new_path.exists() and new_path != file_path:
-                print(f"  ✗ Ошибка: файл '{new_name}' уже существует в директории")
-                print(f"  Не удалось переименовать '{original_name}'\n")
+                sys.stdout.flush()
+                safe_stderr_write(f"  ✗ Ошибка: файл '{new_name}' уже существует в директории\n")
+                safe_stderr_write(f"  Не удалось переименовать '{original_name}'\n")
                 return False
             
             processed_files[original_name] = (new_name, language, file_path)
-            print(f"  ✓ Файл готов к переименованию\n")
+            safe_stdout_write(f"  ✓ Файл готов к переименованию\n\n")
+            sys.stdout.flush()
         
         # Если все проверки пройдены, выполняем переименование
-        print("=" * 50)
-        print("Начинаю переименование файлов...")
+        safe_stdout_write("=" * 50 + "\n")
+        safe_stdout_write("Начинаю переименование файлов...\n")
         
         for original_name, (new_name, language, file_path) in processed_files.items():
             old_path = file_path
             new_path = old_path.parent / new_name
             
-            if old_path != new_path:
-                try:
+            try:
+                if old_path != new_path:
                     old_path.rename(new_path)
-                    print(f"✓ Переименован: '{original_name}' -> '{new_name}'")
-                except Exception as e:
-                    print(f"✗ Ошибка при переименовании '{original_name}': {e}")
-                    return False
-            else:
-                print(f"- Файл '{original_name}' не требует переименования")
-            
-            # Если файл MP3, транслитерируем ID3-теги
-            if new_path.suffix.lower() == '.mp3':
-                print(f"  Обработка ID3-тегов MP3-файла...")
-                self.transliterate_mp3_tags(new_path, language)
-                print()
-            else:
-                print()
+                    safe_stdout_write(f"✓ Переименован: '{original_name}' -> '{new_name}'\n")
+                else:
+                    safe_stdout_write(f"- Файл '{original_name}' не требует переименования\n")
+                
+                # Если файл MP3, транслитерируем ID3-теги
+                if new_path.suffix.lower() == '.mp3':
+                    safe_stdout_write(f"  Обработка ID3-тегов MP3-файла...\n")
+                    self.transliterate_mp3_tags(new_path, language)
+                    safe_stdout_write("\n")
+                else:
+                    safe_stdout_write("\n")
+            except Exception as e:
+                safe_stderr_write(f"✗ Ошибка при обработке файла '{original_name}': {e}\n")
+                return False
         
         return True
 
@@ -1064,13 +1557,13 @@ def add_number_prefixes(directory, flag_ge_1000=False):
     files = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
     
     if not files:
-        print(f"Каталог '{directory}' не содержит файлов")
+        safe_stdout_write(f"Каталог '{directory}' не содержит файлов\n")
         return
     
-    print(f"\n" + "=" * 50)
-    print(f"Добавление числовых префиксов...")
-    print(f"Найдено {len(files)} файлов для добавления префиксов")
-    print(f"Диапазон префиксов: {min_value:04d}-{max_value:04d}\n")
+    safe_stdout_write(f"\n" + "=" * 50 + "\n")
+    safe_stdout_write(f"Добавление числовых префиксов...\n")
+    safe_stdout_write(f"Найдено {len(files)} файлов для добавления префиксов\n")
+    safe_stdout_write(f"Диапазон префиксов: {min_value:04d}-{max_value:04d}\n\n")
     
     # Обрабатываем файлы в каталоге
     for filename in files:
@@ -1081,7 +1574,7 @@ def add_number_prefixes(directory, flag_ge_1000=False):
         if prefix_pattern.match(filename):
             # Удаляем первые 5 символов (4 цифры + пробел)
             new_name = filename[5:]
-            print(f"  Удален существующий префикс у файла: {filename}")
+            safe_stdout_write(f"  Удален существующий префикс у файла: {filename}\n")
         
         # Генерируем случайный префикс
         random_number = random.randint(min_value, max_value)
@@ -1094,9 +1587,9 @@ def add_number_prefixes(directory, flag_ge_1000=False):
         new_filepath = os.path.join(directory, final_name)
         try:
             os.rename(filepath, new_filepath)
-            print(f"✓ Добавлен префикс: {filename} -> {final_name}")
+            safe_stdout_write(f"✓ Добавлен префикс: {filename} -> {final_name}\n")
         except Exception as e:
-            print(f"✗ Ошибка при переименовании {filename}: {e}")
+            safe_stderr_write(f"✗ Ошибка при переименовании {filename}: {e}\n")
 
 
 def process_directory_with_prefixes(directory_path: str, flag_ge_1000: bool = False):
@@ -1105,54 +1598,54 @@ def process_directory_with_prefixes(directory_path: str, flag_ge_1000: bool = Fa
     """
     transliterator = FileTransliterator()
     
-    print("=" * 70)
-    print("НАЧАЛО ОБРАБОТКИ ДИРЕКТОРИИ")
-    print("=" * 70)
+    safe_stdout_write("=" * 70 + "\n")
+    safe_stdout_write("НАЧАЛО ОБРАБОТКИ ДИРЕКТОРИИ\n")
+    safe_stdout_write("=" * 70 + "\n")
     
     # Шаг 1: Транслитерация имен файлов и ID3-тегов
-    print("\n" + "=" * 50)
-    print("ШАГ 1: ТРАНСЛИТЕРАЦИЯ ИМЕН ФАЙЛОВ И ID3-ТЕГОВ")
-    print("=" * 50)
+    safe_stdout_write("\n" + "=" * 50 + "\n")
+    safe_stdout_write("ШАГ 1: ТРАНСЛИТЕРАЦИЯ ИМЕН ФАЙЛОВ И ID3-ТЕГОВ\n")
+    safe_stdout_write("=" * 50 + "\n")
     
     try:
         success = transliterator.process_directory(directory_path)
         if not success:
-            print("\n" + "=" * 50)
-            print("Транслитерация прервана из-за ошибок")
+            safe_stdout_write("\n" + "=" * 50 + "\n")
+            safe_stdout_write("Транслитерация прервана из-за ошибок\n")
             return False
     except Exception as e:
-        print(f"\nОшибка при транслитерации: {e}")
+        safe_stderr_write(f"\nОшибка при транслитерации: {e}\n")
         return False
     
     # Шаг 2: Добавление числовых префиксов
-    print("\n" + "=" * 50)
-    print("ШАГ 2: ДОБАВЛЕНИЕ ЧИСЛОВЫХ ПРЕФИКСОВ")
-    print("=" * 50)
+    safe_stdout_write("\n" + "=" * 50 + "\n")
+    safe_stdout_write("ШАГ 2: ДОБАВЛЕНИЕ ЧИСЛОВЫХ ПРЕФИКСОВ\n")
+    safe_stdout_write("=" * 50 + "\n")
     
     try:
         add_number_prefixes(directory_path, flag_ge_1000)
     except Exception as e:
-        print(f"\nОшибка при добавлении префиксов: {e}")
+        safe_stderr_write(f"\nОшибка при добавлении префиксов: {e}\n")
         return False
     
     return True
 
 
-def main():
+def main(directory_path, flag_ge_1000 = False):
     """Основная функция программы"""
-    if len(sys.argv) < 2:
-        print("Использование:")
-        print("  python transliterate_files.py <путь_к_директории> [--ge-1000] [--only-prefixes] [--only-transliterate]")
-        print("\nОпции:")
-        print("  --ge-1000          : Использовать префиксы в диапазоне 1000-9999 (по умолчанию: 1-9999)")
-        print("  --only-prefixes    : Только добавить/изменить префиксы (без транслитерации)")
-        print("  --only-transliterate: Только транслитерировать (без добавления префиксов)")
-        sys.exit(1)
+    #if len(sys.argv) < 2:
+    #    print("Использование:")
+    #    print("  python transliterate_files.py <путь_к_директории> [--ge-1000] [--only-prefixes] [--only-transliterate]")
+    #    print("\nОпции:")
+    #    print("  --ge-1000          : Использовать префиксы в диапазоне 1000-9999 (по умолчанию: 1-9999)")
+    #    print("  --only-prefixes    : Только добавить/изменить префиксы (без транслитерации)")
+    #    print("  --only-transliterate: Только транслитерировать (без добавления префиксов)")
+    #    sys.exit(1)
     
-    directory_path = sys.argv[1]
+    #directory_path = sys.argv[1]
     
     if not directory_path:
-        print("Ошибка: путь не может быть пустым")
+        safe_stderr_write("Ошибка: путь не может быть пустым\n")
         sys.exit(1)
     
     # Проверяем флаги
@@ -1162,60 +1655,60 @@ def main():
     
     # Проверяем конфликт флагов
     if only_prefixes and only_transliterate:
-        print("Ошибка: нельзя одновременно использовать --only-prefixes и --only-transliterate")
+        safe_stdout_write("Ошибка: нельзя одновременно использовать --only-prefixes и --only-transliterate\n")
         sys.exit(1)
     
     try:
         if only_prefixes:
             # Только добавление префиксов
-            print("=" * 70)
-            print("РЕЖИМ: ТОЛЬКО ДОБАВЛЕНИЕ/ИЗМЕНЕНИЕ ПРЕФИКСОВ")
-            print("=" * 70)
+            safe_stdout_write("=" * 70 + "\n")
+            safe_stdout_write("РЕЖИМ: ТОЛЬКО ДОБАВЛЕНИЕ/ИЗМЕНЕНИЕ ПРЕФИКСОВ\n")
+            safe_stdout_write("=" * 70 + "\n")
             add_number_prefixes(directory_path, flag_ge_1000)
-            print("\n" + "=" * 70)
-            print("ДОБАВЛЕНИЕ ПРЕФИКСОВ ЗАВЕРШЕНО")
-            print("=" * 70)
+            safe_stdout_write("\n" + "=" * 70 + "\n")
+            safe_stdout_write("ДОБАВЛЕНИЕ ПРЕФИКСОВ ЗАВЕРШЕНО\n")
+            safe_stdout_write("=" * 70 + "\n")
         
         elif only_transliterate:
             # Только транслитерация
-            print("=" * 70)
-            print("РЕЖИМ: ТОЛЬКО ТРАНСЛИТЕРАЦИЯ")
-            print("=" * 70)
+            safe_stdout_write("=" * 70 + "\n")
+            safe_stdout_write("РЕЖИМ: ТОЛЬКО ТРАНСЛИТЕРАЦИЯ\n")
+            safe_stdout_write("=" * 70 + "\n")
             transliterator = FileTransliterator()
             success = transliterator.process_directory(directory_path)
             if success:
-                print("\n" + "=" * 70)
-                print("ТРАНСЛИТЕРАЦИЯ ЗАВЕРШЕНА")
-                print("=" * 70)
+                safe_stdout_write("\n" + "=" * 70 + "\n")
+                safe_stdout_write("ТРАНСЛИТЕРАЦИЯ ЗАВЕРШЕНА\n")
+                safe_stdout_write("=" * 70 + "\n")
             else:
-                print("\n" + "=" * 70)
-                print("ТРАНСЛИТЕРАЦИЯ ПРЕРВАНА ИЗ-ЗА ОШИБОК")
-                print("=" * 70)
+                safe_stdout_write("\n" + "=" * 70 + "\n")
+                safe_stdout_write("ТРАНСЛИТЕРАЦИЯ ПРЕРВАНА ИЗ-ЗА ОШИБОК\n")
+                safe_stdout_write("=" * 70 + "\n")
                 sys.exit(1)
         
         else:
             # Полный процесс: транслитерация + добавление префиксов (режим по умолчанию)
-            print("=" * 70)
-            print("РЕЖИМ: ПОЛНАЯ ОБРАБОТКА (ТРАНСЛИТЕРАЦИЯ + ПРЕФИКСЫ)")
-            print("=" * 70)
+            safe_stdout_write("=" * 70 + "\n")
+            safe_stdout_write("РЕЖИМ: ПОЛНАЯ ОБРАБОТКА (ТРАНСЛИТЕРАЦИЯ + ПРЕФИКСЫ)\n")
+            safe_stdout_write("=" * 70 + "\n")
             success = process_directory_with_prefixes(directory_path, flag_ge_1000)
             if success:
-                print("\n" + "=" * 70)
-                print("ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО!")
-                print("=" * 70)
+                safe_stdout_write("\n" + "=" * 70 + "\n")
+                safe_stdout_write("ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО!\n")
+                safe_stdout_write("=" * 70 + "\n")
             else:
-                print("\n" + "=" * 70)
-                print("ОБРАБОТКА ПРЕРВАНА ИЗ-ЗА ОШИБОК")
-                print("=" * 70)
+                safe_stdout_write("\n" + "=" * 70 + "\n")
+                safe_stdout_write("ОБРАБОТКА ПРЕРВАНА ИЗ-ЗА ОШИБОК\n")
+                safe_stdout_write("=" * 70 + "\n")
                 sys.exit(1)
                 
     except KeyboardInterrupt:
-        print("\n\nОбработка прервана пользователем")
+        safe_stderr_write("\n\nОбработка прервана пользователем\n")
         sys.exit(1)
     except Exception as e:
-        print(f"\nПроизошла непредвиденная ошибка: {e}")
+        safe_stderr_write(f"\nПроизошла непредвиденная ошибка: {e}\n")
         import traceback
-        traceback.print_exc()
+        traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 
 
