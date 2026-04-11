@@ -1438,8 +1438,8 @@ class FileTransliterator:
             traceback.print_exc(file=sys.stderr)
             return False
     
-    def process_directory(self, directory_path: str) -> bool:
-        """Обрабатывает все файлы в указанной директории"""
+    def process_directory(self, directory_path: str, testonly: bool = False) -> bool:
+        """Обрабатывает все файлы в указанной директории (и во вложенных, если testonly=True)"""
         path = Path(directory_path)
         
         if not path.exists():
@@ -1450,8 +1450,11 @@ class FileTransliterator:
             safe_stderr_write(f"Ошибка: '{directory_path}' не является директорией\n")
             return False
         
-        # Собираем все файлы в директории
-        files = [f for f in path.iterdir() if f.is_file()]
+        # Собираем все файлы: если testonly - рекурсивно, иначе только в текущей директории
+        if testonly:
+            files = [f for f in path.rglob('*') if f.is_file()]
+        else:
+            files = [f for f in path.iterdir() if f.is_file()]
         
         if not files:
             safe_stdout_write(f"Директория '{directory_path}' не содержит файлов\n")
@@ -1465,6 +1468,8 @@ class FileTransliterator:
         for file_path in files:
             original_name = file_path.name
             safe_stdout_write(f"Обработка файла: {original_name}\n")
+            if testonly:
+                safe_stdout_write(f"  [ТЕСТ] Полный путь: {file_path}\n")
             sys.stdout.flush()
             
             try:
@@ -1492,7 +1497,7 @@ class FileTransliterator:
                 safe_stderr_write(f"  Но файл с таким именем уже будет создан из другого исходного файла\n")
                 return False
             
-            # Проверяем, существует ли уже файл с таким именем
+            # Проверяем, существует ли уже файл с таким именем (в той же папке)
             new_path = file_path.parent / new_name
             if new_path.exists() and new_path != file_path:
                 sys.stdout.flush()
@@ -1504,7 +1509,19 @@ class FileTransliterator:
             safe_stdout_write(f"  ✓ Файл готов к переименованию\n\n")
             sys.stdout.flush()
         
-        # Если все проверки пройдены, выполняем переименование
+        # Если все проверки пройдены, выполняем переименование (если не testonly)
+        if testonly:
+            safe_stdout_write("=" * 50 + "\n")
+            safe_stdout_write("ТЕСТОВЫЙ РЕЖИМ: реальные переименования и изменения тегов НЕ выполняются.\n")
+            safe_stdout_write("Были бы выполнены следующие действия:\n")
+            for original_name, (new_name, language, file_path) in processed_files.items():
+                if file_path.name != new_name:
+                    safe_stdout_write(f"  Переименование: '{original_name}' -> '{new_name}'\n")
+                if file_path.suffix.lower() == '.mp3':
+                    safe_stdout_write(f"    Транслитерация ID3-тегов в файле (после переименования)\n")
+            safe_stdout_write("=" * 50 + "\n")
+            return True
+        
         safe_stdout_write("=" * 50 + "\n")
         safe_stdout_write("Начинаю переименование файлов...\n")
         
@@ -1592,14 +1609,17 @@ def add_number_prefixes(directory, flag_ge_1000=False):
             safe_stderr_write(f"✗ Ошибка при переименовании {filename}: {e}\n")
 
 
-def process_directory_with_prefixes(directory_path: str, flag_ge_1000: bool = False):
+def process_directory_with_prefixes(directory_path: str, flag_ge_1000: bool = False, testonly: bool = False):
     """
     Полный процесс обработки директории: транслитерация + добавление префиксов
+    Если testonly=True, то реальные изменения не вносятся.
     """
     transliterator = FileTransliterator()
     
     safe_stdout_write("=" * 70 + "\n")
     safe_stdout_write("НАЧАЛО ОБРАБОТКИ ДИРЕКТОРИИ\n")
+    if testonly:
+        safe_stdout_write("!!! ТЕСТОВЫЙ РЕЖИМ (БЕЗ РЕАЛЬНЫХ ИЗМЕНЕНИЙ) !!!\n")
     safe_stdout_write("=" * 70 + "\n")
     
     # Шаг 1: Транслитерация имен файлов и ID3-тегов
@@ -1608,7 +1628,7 @@ def process_directory_with_prefixes(directory_path: str, flag_ge_1000: bool = Fa
     safe_stdout_write("=" * 50 + "\n")
     
     try:
-        success = transliterator.process_directory(directory_path)
+        success = transliterator.process_directory(directory_path, testonly=testonly)
         if not success:
             safe_stdout_write("\n" + "=" * 50 + "\n")
             safe_stdout_write("Транслитерация прервана из-за ошибок\n")
@@ -1617,7 +1637,13 @@ def process_directory_with_prefixes(directory_path: str, flag_ge_1000: bool = Fa
         safe_stderr_write(f"\nОшибка при транслитерации: {e}\n")
         return False
     
-    # Шаг 2: Добавление числовых префиксов
+    # Шаг 2: Добавление числовых префиксов (только если не testonly)
+    if testonly:
+        safe_stdout_write("\n" + "=" * 50 + "\n")
+        safe_stdout_write("ШАГ 2: ДОБАВЛЕНИЕ ЧИСЛОВЫХ ПРЕФИКСОВ (ПРОПУЩЕНО В ТЕСТОВОМ РЕЖИМЕ)\n")
+        safe_stdout_write("=" * 50 + "\n")
+        return True
+    
     safe_stdout_write("\n" + "=" * 50 + "\n")
     safe_stdout_write("ШАГ 2: ДОБАВЛЕНИЕ ЧИСЛОВЫХ ПРЕФИКСОВ\n")
     safe_stdout_write("=" * 50 + "\n")
@@ -1635,11 +1661,12 @@ def main(directory_path, flag_ge_1000 = False):
     """Основная функция программы"""
     #if len(sys.argv) < 2:
     #    print("Использование:")
-    #    print("  python transliterate_files.py <путь_к_директории> [--ge-1000] [--only-prefixes] [--only-transliterate]")
+    #    print("  python transliterate_files.py <путь_к_директории> [--ge-1000] [--only-prefixes] [--only-transliterate] [--testonly]")
     #    print("\nОпции:")
     #    print("  --ge-1000          : Использовать префиксы в диапазоне 1000-9999 (по умолчанию: 1-9999)")
     #    print("  --only-prefixes    : Только добавить/изменить префиксы (без транслитерации)")
     #    print("  --only-transliterate: Только транслитерировать (без добавления префиксов)")
+    #    print("  --testonly         : Тестовый прогон без реальных изменений (сканирует вложенные папки)")
     #    sys.exit(1)
     
     #directory_path = sys.argv[1]
@@ -1652,6 +1679,7 @@ def main(directory_path, flag_ge_1000 = False):
     flag_ge_1000 = '--ge-1000' in sys.argv
     only_prefixes = '--only-prefixes' in sys.argv
     only_transliterate = '--only-transliterate' in sys.argv
+    testonly = '--testonly' in sys.argv
     
     # Проверяем конфликт флагов
     if only_prefixes and only_transliterate:
@@ -1663,8 +1691,13 @@ def main(directory_path, flag_ge_1000 = False):
             # Только добавление префиксов
             safe_stdout_write("=" * 70 + "\n")
             safe_stdout_write("РЕЖИМ: ТОЛЬКО ДОБАВЛЕНИЕ/ИЗМЕНЕНИЕ ПРЕФИКСОВ\n")
+            if testonly:
+                safe_stdout_write("!!! ТЕСТОВЫЙ РЕЖИМ (БЕЗ РЕАЛЬНЫХ ИЗМЕНЕНИЙ) !!!\n")
             safe_stdout_write("=" * 70 + "\n")
-            add_number_prefixes(directory_path, flag_ge_1000)
+            if testonly:
+                safe_stdout_write("Тестовый режим для префиксов не поддерживается (пропускаем)\n")
+            else:
+                add_number_prefixes(directory_path, flag_ge_1000)
             safe_stdout_write("\n" + "=" * 70 + "\n")
             safe_stdout_write("ДОБАВЛЕНИЕ ПРЕФИКСОВ ЗАВЕРШЕНО\n")
             safe_stdout_write("=" * 70 + "\n")
@@ -1673,9 +1706,11 @@ def main(directory_path, flag_ge_1000 = False):
             # Только транслитерация
             safe_stdout_write("=" * 70 + "\n")
             safe_stdout_write("РЕЖИМ: ТОЛЬКО ТРАНСЛИТЕРАЦИЯ\n")
+            if testonly:
+                safe_stdout_write("!!! ТЕСТОВЫЙ РЕЖИМ (БЕЗ РЕАЛЬНЫХ ИЗМЕНЕНИЙ) !!!\n")
             safe_stdout_write("=" * 70 + "\n")
             transliterator = FileTransliterator()
-            success = transliterator.process_directory(directory_path)
+            success = transliterator.process_directory(directory_path, testonly=testonly)
             if success:
                 safe_stdout_write("\n" + "=" * 70 + "\n")
                 safe_stdout_write("ТРАНСЛИТЕРАЦИЯ ЗАВЕРШЕНА\n")
@@ -1690,8 +1725,10 @@ def main(directory_path, flag_ge_1000 = False):
             # Полный процесс: транслитерация + добавление префиксов (режим по умолчанию)
             safe_stdout_write("=" * 70 + "\n")
             safe_stdout_write("РЕЖИМ: ПОЛНАЯ ОБРАБОТКА (ТРАНСЛИТЕРАЦИЯ + ПРЕФИКСЫ)\n")
+            if testonly:
+                safe_stdout_write("!!! ТЕСТОВЫЙ РЕЖИМ (БЕЗ РЕАЛЬНЫХ ИЗМЕНЕНИЙ) !!!\n")
             safe_stdout_write("=" * 70 + "\n")
-            success = process_directory_with_prefixes(directory_path, flag_ge_1000)
+            success = process_directory_with_prefixes(directory_path, flag_ge_1000, testonly=testonly)
             if success:
                 safe_stdout_write("\n" + "=" * 70 + "\n")
                 safe_stdout_write("ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО!\n")
