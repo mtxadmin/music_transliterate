@@ -64,6 +64,7 @@ def show_help():
     print()
     print("  - Если битрейт 320 или 319 kbps, удаляет суффиксы 320 или 319 из имени файла (если они есть)")
     print("  - Если битрейт не 320 или 319 kbps, добавляет его значение в конец имени файла")
+    print("  - Для монофонических файлов добавляет 'mono' перед битрейтом")
     print("  - Убирает пробелы и подчеркивания в конце имени файла")
     print("  - Не добавляет битрейт, если он уже указан в конце имени")
     print()
@@ -122,25 +123,28 @@ def get_mp3_bitrate(file_path):
         
         # Проверяем, что файл действительно MP3
         if not audio or not audio.info:
-            return None, "Не удалось прочитать информацию о файле"
+            return None, None, f"Не удалось прочитать информацию о файле: {file_path}"
         
         # Библиотека mutagen возвращает битрейт в bps, переводим в kbps
         bitrate_kbps = audio.info.bitrate // 1000
         
+        # Получаем количество каналов (1 - моно, 2 - стерео)
+        channels = audio.info.channels if hasattr(audio.info, 'channels') else None
+        
         # Проверяем, что битрейт в разумных пределах
         if bitrate_kbps < 32 or bitrate_kbps > 320:
-            return None, f"Неверный битрейт {bitrate_kbps} kbps"
+            return None, channels, f"Неверный битрейт {bitrate_kbps} kbps: {file_path}"
         
-        return bitrate_kbps, ""
+        return bitrate_kbps, channels, ""
         
     except FileNotFoundError:
-        return None, "Файл не найден"
+        return None, None, f"Файл не найден: {file_path}"
     except PermissionError:
-        return None, "Нет доступа к файлу"
+        return None, None, f"Нет доступа к файлу: {file_path}"
     except HeaderNotFoundError:
-        return None, "Файл не является корректным MP3"
+        return None, None, f"Файл не является корректным MP3: {file_path}"
     except Exception as e:
-        return None, f"Ошибка чтения: {type(e).__name__}"
+        return None, None, f"Ошибка чтения {type(e).__name__}: {file_path}"
 
 def clean_trailing_chars(filename):
     """Убрать пробелы и подчеркивания в конце имени файла (без расширения)"""
@@ -203,12 +207,11 @@ def remove_320_suffix(filename, bitrate_kbps):
 
 def process_mp3_file(file_path):
     """Обработать один MP3 файл"""
-    # Получаем битрейт файла
-    bitrate_kbps, error_message = get_mp3_bitrate(file_path)
+    # Получаем битрейт файла и количество каналов
+    bitrate_kbps, channels, error_message = get_mp3_bitrate(file_path)
     if bitrate_kbps is None:
-        # Выводим сообщение об ошибке чтения файла
-        filename = os.path.basename(file_path)
-        print_color(f"{error_message}: {filename}", "BRIGHT_RED")
+        # Выводим сообщение об ошибке чтения файла с полным путем
+        print_color(error_message, "BRIGHT_RED")
         return False, False  # (успех, переименован с битрейтом)
     
     # Получаем имя файла и путь к директории
@@ -246,19 +249,32 @@ def process_mp3_file(file_path):
         # Убираем расширение и очищаем от пробелов/подчеркиваний в конце
         name_without_ext, ext = clean_trailing_chars(filename)
         
+        # Определяем, моно ли файл
+        is_mono = channels == 1 if channels else False
+        
         # Формируем новое имя файла
-        new_name = f"{name_without_ext} {bitrate_kbps}{ext}"
+        if is_mono:
+            new_name = f"{name_without_ext} mono {bitrate_kbps}{ext}"
+        else:
+            new_name = f"{name_without_ext} {bitrate_kbps}{ext}"
+        
         new_path = os.path.join(dir_name, new_name)
         
         # Проверяем, что новый путь отличается от старого
         if new_path == file_path:
-            print(f"Файл {filename} не требует изменений (битрейт: {bitrate_kbps} kbps)")
+            # Определяем тип файла для сообщения
+            file_type = "моно" if is_mono else ""
+            type_suffix = f" ({file_type})" if is_mono else ""
+            print(f"Файл {filename} не требует изменений (битрейт: {bitrate_kbps} kbps{type_suffix})")
             return True, False  # (успех, переименован с битрейтом)
         
         # Безопасно переименовываем файл
         try:
             os.rename(file_path, new_path)
-            print_color(f"Переименован: {filename} -> {new_name} (битрейт: {bitrate_kbps} kbps)", "YELLOW")
+            # Определяем тип файла для сообщения
+            file_type = "моно" if is_mono else ""
+            type_prefix = f" ({file_type})" if is_mono else ""
+            print_color(f"Переименован{type_prefix}: {filename} -> {new_name} (битрейт: {bitrate_kbps} kbps)", "YELLOW")
             return True, True  # (успех, переименован с битрейтом)
         except Exception as e:
             print_color(f"Ошибка при переименовании {filename}: {e}", "BRIGHT_RED")
@@ -270,13 +286,21 @@ def process_mp3_file(file_path):
             new_path = os.path.join(dir_name, name_without_ext + ext)
             try:
                 os.rename(file_path, new_path)
-                print(f"Очищено имя: {filename} -> {name_without_ext + ext}")
+                # Определяем тип файла для сообщения
+                is_mono = channels == 1 if channels else False
+                file_type = "моно" if is_mono else ""
+                type_suffix = f" ({file_type})" if is_mono else ""
+                print(f"Очищено имя{type_suffix}: {filename} -> {name_without_ext + ext} (битрейт: {bitrate_kbps} kbps)")
                 return True, False  # (успех, переименован с битрейтом)
             except Exception as e:
                 print_color(f"Ошибка при переименовании {filename}: {e}", "BRIGHT_RED")
                 return False, False
         else:
-            print(f"Файл {filename} не требует изменений (битрейт: {bitrate_kbps} kbps)")
+            # Определяем тип файла для сообщения
+            is_mono = channels == 1 if channels else False
+            file_type = "моно" if is_mono else ""
+            type_suffix = f" ({file_type})" if is_mono else ""
+            print(f"Файл {filename} не требует изменений (битрейт: {bitrate_kbps} kbps{type_suffix})")
             return True, False  # (успех, переименован с битрейтом)
 
 def find_and_process_mp3_files(directory):
@@ -315,6 +339,7 @@ def find_and_process_mp3_files(directory):
     processed = 0
     renamed_with_bitrate = 0  # Количество переименований с добавлением битрейта
     errors = 0
+    mono_files_count = 0  # Количество монофайлов
     
     # Обрабатываем каждый файл
     for mp3_file in mp3_files:
