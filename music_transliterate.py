@@ -605,7 +605,7 @@ class App(tk.Tk):
                 elif kind == 'folder_progress':
                     cur, tot, path = data
                     if cur >= tot:
-                        self.folder_label.config(text="Готово")
+                        self.folder_label.config(text=path or "Готово")
                     else:
                         self.folder_label.config(text=f"Папка {cur + 1}/{tot}: {path}")
                 elif kind == 'done':
@@ -729,6 +729,9 @@ def _run_cli(argv: List[str]) -> int:
         except RuntimeError as e:
             safe_stderr_write(f"Ошибка: {e}\n")
             exit_code = 1
+            if args.testonly:
+                safe_stderr_write("Тестирование прервано на первой ошибке\n")
+                break
     return exit_code
 
 
