@@ -355,12 +355,15 @@ def run_batch(folders: List[dict], output_dir: Optional[str], testonly: bool,
     """Обрабатывает несколько папок последовательно в общую output_dir.
 
     folders: список dict с ключами path, ge_1000, recursive.
+    В тестовом режиме (testonly=True) проверка прерывается на первой ошибке,
+    в боевом — ошибки собираются, а обработка продолжается.
     Возвращает {'success': [path, ...], 'failed': [(path, err), ...]}.
     """
     used_names: Set[str] = set()
     total = len(folders)
     success_list: List[str] = []
     failed_list: List[Tuple[str, str]] = []
+    aborted = False
 
     for i, fc in enumerate(folders):
         if cancel_event and cancel_event.is_set():
@@ -391,19 +394,32 @@ def run_batch(folders: List[dict], output_dir: Optional[str], testonly: bool,
         except RuntimeError as e:
             safe_stderr_write(f"✗ Ошибка при обработке '{fc.get('path', '')}': {e}\n")
             failed_list.append((fc.get('path', ''), str(e)))
+            if testonly:
+                aborted = True
+                break
         except Exception as e:
             safe_stderr_write(f"✗ Неожиданная ошибка при обработке '{fc.get('path', '')}': {e}\n")
             traceback.print_exc(file=sys.stderr)
             failed_list.append((fc.get('path', ''), str(e)))
+            if testonly:
+                aborted = True
+                break
 
     if folder_progress_callback:
         try:
-            folder_progress_callback(total, total, "Готово")
+            folder_progress_callback(total, total,
+                                     'Прервано' if aborted else 'Готово')
         except Exception:
             pass
 
     safe_stdout_write("\n" + "=" * 70 + "\n")
+    if aborted:
+        safe_stdout_write("Тестирование прервано на первой ошибке\n")
     safe_stdout_write(f"ИТОГО: успешно {len(success_list)}, с ошибками {len(failed_list)}\n")
+    if aborted:
+        not_checked = total - len(success_list) - len(failed_list)
+        if not_checked > 0:
+            safe_stdout_write(f"Не проверено папок: {not_checked}\n")
     if failed_list:
         safe_stdout_write("Папки с ошибками:\n")
         for p, err in failed_list:
