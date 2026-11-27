@@ -89,6 +89,75 @@ def test_detect_language(transliterator, text, expected):
     assert transliterator.detect_language(text) == expected
 
 
+def test_bulgarian_hard_sign_is_a_vowel(transliterator):
+    """Болгарский: "ъ" — гласная, в русском он стоит только перед е/ё/ю/я."""
+    for text in ('Път към дома', 'Мъжът и жената', 'Сънят', 'Сълзи',
+                 'Дъжд вали', 'Пътуване'):
+        assert transliterator.detect_language(text) == 'bulgarian'
+    for text in ('Съезд', 'Объявление', 'Подъезд', 'Разъяснение',
+                 'Адъютант', 'Инъекция', 'Съёмка'):
+        assert transliterator.detect_language(text) == 'russian'
+
+
+def test_bulgarian_lexicon_without_hard_sign(transliterator):
+    """Названия без "ъ", где различие только в щ/х/ь, ловит словарь."""
+    for text in ('Щастие', 'Още малко', 'Нощта е тиха', 'Хубава си',
+                 'Актьор', 'Шофьор', 'Режисьор'):
+        assert transliterator.detect_language(text) == 'bulgarian'
+
+
+def test_russian_words_are_not_bulgarian(transliterator):
+    """Русские слова с щ/х/ъ не должны попадать в болгарский."""
+    for text in ('Щука', 'Хлеб и соль', 'Мощь', 'Защита', 'Холодно',
+                 'Хора', 'Храм', 'Хотел', 'Пещера', 'Вещи', 'После',
+                 'Много', 'Само', 'Вече'):
+        assert transliterator.detect_language(text) == 'russian'
+
+
+def test_word_final_hard_sign_is_ambiguous(transliterator):
+    """В конце слова "ъ" — русская стилизация ("Барнаулъ"), а не болгарский."""
+    for text in ('Барнаулъ', 'Пиздецъ', 'Бульваръ', 'Орехъ', 'Разгромъ',
+                 'Безъимянная', 'Vъlica'):
+        assert transliterator.detect_language(text) == 'russian'
+
+
+def test_ukrainian_shche_is_not_bulgarian(transliterator):
+    """Украинское "ще" пишется как болгарское, но і/ї/є выдают украинский."""
+    for text in ('Скільки Ще', 'Так Ніхто Ще Не Кохав',
+                 'Я Тебе Ще Більше Кохаю'):
+        assert transliterator.detect_language(text) == 'ukrainian'
+
+
+def test_bulgarian_transliteration(transliterator):
+    """Болгарская таблица: ъ -> a, щ -> sht, х -> h, ь -> y."""
+    assert transliterator.process_filename('Път към дома.mp3') == (
+        'Pat kam doma.mp3', 'bulgarian')
+    assert transliterator.process_filename('Мъжът и жената.mp3') == (
+        'Mazhat i zhenata.mp3', 'bulgarian')
+    assert transliterator.process_filename('Щастие.mp3') == (
+        'Shtastie.mp3', 'bulgarian')
+    assert transliterator.process_filename('Хубава си.mp3') == (
+        'Hubava si.mp3', 'bulgarian')
+    assert transliterator.process_filename('Актьор.mp3') == (
+        'Aktyor.mp3', 'bulgarian')
+
+
+def test_decoration_falls_back_to_european_table(transliterator):
+    """Декорация в имени, для которого выбрана таблица без декоративного слоя.
+
+    Регрессия: "Українська ǝ.mp3" падала с ошибкой «остались не-ASCII»,
+    потому что декоративный слой есть только в русской и европейской
+    таблицах. Недостающие символы берутся из европейской таблицы, а не
+    заменяют язык целиком ("Pat e", а не "P't e").
+    """
+    assert transliterator.process_filename('Українська ǝ.mp3') == (
+        "Ukrains'ka e.mp3", 'ukrainian')
+    assert transliterator.process_filename('Път ǝ.mp3') == (
+        'Pat e.mp3', 'bulgarian')
+    assert transliterator.process_filename('Хубава ᴢвезда.mp3') == (
+        'Hubava Zvezda.mp3', 'bulgarian')
+
+
 @pytest.mark.parametrize('text,expected', SANITIZE_CASES)
 def test_sanitize_filename(transliterator, text, expected):
     assert transliterator.sanitize_filename(text) == expected
