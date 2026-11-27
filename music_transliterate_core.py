@@ -26,6 +26,42 @@ from typing import Dict, Optional, Tuple, Set, List, Any, Callable
 from music_transliterate_tables import TransliterationTablesMixin
 
 
+# --- Определение болгарского языка -------------------------------------------
+# Болгарский и русский различаются всего четырьмя парами букв:
+#   х -> h / kh,  щ -> sht / shch,  ъ -> a / ',  ь -> y / '
+# Поэтому язык важно определять только тогда, когда в тексте есть эти буквы.
+
+# В русском твёрдый знак стоит только перед этими буквами
+# ("съезд", "объявление", "съёмка", "адъютант"), а в дореформенной
+# стилизации — ещё перед "и" ("Безъимянная").
+HARD_SIGN_RUSSIAN_LETTERS = 'еёюяи'
+
+# Букв ы/э/ё нет в болгарском алфавите: если они есть, текст не болгарский.
+RUSSIAN_ONLY_LETTERS = 'ыэё'
+
+# Буквы і/ї/є/ґ есть только в украинском: такой текст тоже не болгарский
+# (иначе украинское "ще" = "ещё/будет" уводило бы названия в болгарский).
+UKRAINIAN_LETTERS = 'іїєґ'
+
+# Болгарские слова, которых нет в русском. Нужны для названий без "ъ"
+# (по нему язык определяется однозначно), но с "щ"/"х"/"ь": "Щастие",
+# "Още малко", "Хубава си". В списке только слова с этими буквами —
+# остальные ("това", "сега", "вчера") транслитерируются одинаково в обоих
+# языках и только создавали бы ложные срабатывания ("Сега" = Sega).
+# Слова, совпадающие с русскими (хора, храм, хотел, характер, защита,
+# мощь, после, много, само, вече, вещи, вещ), сюда тоже не входят.
+# Слова "ще" здесь нет: в украинском оно пишется так же и встречается
+# в названиях гораздо чаще ("Скільки Ще", "Ти Ще Спиш").
+BULGARIAN_WORDS = frozenset("""
+още щастие щастлив щастлива щастливо щастливи
+помощ помощта нощ нощта вещта поща пощата
+площад площада площадът пещ пещта общо
+хляб хляба хлябът хубав хубава хубаво хубави хайде
+храна храната хиляда хиляди хижа хижата
+актьор актьори шофьор шофьори режисьор режисьори диригьор
+""".split())
+
+
 # безопасная запись в stderr с обработкой ошибок кодировки
 def safe_stderr_write(message: str) -> None:
     """Безопасная запись в stderr с обработкой ошибок кодировки."""
@@ -84,15 +120,14 @@ class FileTransliterator(TransliterationTablesMixin):
         # выигрывает. То есть полный алфавит не означает "украинский текст
         # состоит из этих букв", он лишь уравнивает вклад общих букв.
         #
-        # Болгарский набор — подмножество русского (нет ы/э/ё, а ъ есть у обоих),
-        # поэтому его счёт никогда не превышает русский: болгарский текст
-        # определяется как русский, и болгарская таблица автоматически не
-        # выбирается (ъ при этом транслитерируется по-русски: "'", а не "a").
+        # Болгарского набора здесь нет: он был подмножеством русского (нет
+        # ы/э/ё), поэтому не мог выиграть ни при каком тексте. Болгарский
+        # определяется отдельно — см. _detect_bulgarian(): по "ъ" как гласной
+        # и по словарю BULGARIAN_WORDS.
         self.language_specific_chars = {
             'russian': set('абвгдеёжзийклмнопрстуфхцчшщъыьэюя'),
             'ukrainian': set('абвгґдеєжзиіїйклмнопрстуфхцчшщьюя'),
             'polish': set('ąćęłńóśźż'),
-            'bulgarian': set('абвгдежзийклмнопрстуфхцчшщъьюя'),
             'german': set('äöüß'),
             'european': set('áàâãäåæçéèêëíìîïñóòôõöøœúùûüýÿ')
         }
@@ -391,17 +426,55 @@ class FileTransliterator(TransliterationTablesMixin):
         
         return result
     
+    def _detect_bulgarian(self, text_lower: str) -> bool:
+        """Болгарский по твёрдому знаку или по словарю.
+
+        В русском "ъ" — разделительный знак и стоит только перед е/ё/ю/я
+        ("съезд", "объявление"), в болгарском — гласная ("път", "мъж", "сън").
+        Поэтому "ъ" перед любой другой кириллической буквой означает болгарский.
+
+        "ъ" в конце слова, перед разделителем или латиницей ничего не решает:
+        в болгарском слова на "ъ" почти не заканчиваются, а в русском так
+        иногда стилизуют названия ("Барнаулъ", "Пиздецъ").
+
+        Если "ъ" нет, смотрим словарь BULGARIAN_WORDS — он нужен для названий
+        вида "Щастие" или "Хубава си", где различие только в щ/х/ь.
+        """
+        if any(char in RUSSIAN_ONLY_LETTERS for char in text_lower):
+            return False
+        if any(char in UKRAINIAN_LETTERS for char in text_lower):
+            return False
+
+        for index, char in enumerate(text_lower):
+            if char != 'ъ':
+                continue
+            next_char = (text_lower[index + 1]
+                         if index + 1 < len(text_lower) else '')
+            if not 'а' <= next_char <= 'я':
+                # конец слова, разделитель или латиница — неоднозначно
+                continue
+            if next_char not in HARD_SIGN_RUSSIAN_LETTERS:
+                return True
+
+        words = re.findall(r'[а-яё]+', text_lower)
+        return any(word in BULGARIAN_WORDS for word in words)
+
     def detect_language(self, text: str) -> Optional[str]:
         """Определяет язык по специфическим символам в тексте.
 
-        Сравнивается не алфавит, а количество вхождений символов из
-        language_specific_chars: побеждает максимум, при равенстве — первый
-        в словаре (русский). Наборы намеренно содержат полные алфавиты:
-        общие буквы дают одинаковый вклад, а исход решают уникальные
-        (єґії против ыэё). Подробнее — в комментарии в __init__.
+        Болгарский проверяется отдельно (см. _detect_bulgarian), потому что
+        по алфавиту он неотличим от русского. Остальные языки сравниваются
+        по количеству вхождений символов из language_specific_chars:
+        побеждает максимум, при равенстве — первый в словаре (русский).
+        Наборы намеренно содержат полные алфавиты: общие буквы дают
+        одинаковый вклад, а исход решают уникальные (єґії против ыэё).
+        Подробнее — в комментарии в __init__.
         """
         text_lower = text.lower()
-        
+
+        if self._detect_bulgarian(text_lower):
+            return 'bulgarian'
+
         # Считаем количество специфических символов для каждого языка
         language_scores = {}
         
@@ -426,33 +499,16 @@ class FileTransliterator(TransliterationTablesMixin):
                 language = 'european'
 
         transliteration_table = self.transliteration_tables[language]
-        result_chars = []
+        # Резерв для символов, которых нет в выбранной таблице: декоративный
+        # слой (Small Caps, коптские буквы) и прочие европейские символы есть
+        # только в европейской таблице, а она включает и русскую кириллицу.
+        # Так имя «Път ǝ» остаётся болгарским («Pat e»), а не превращается
+        # в русское («P't e»).
+        fallback_table = (None if language == 'european'
+                          else self.transliteration_tables['european'])
+        result = self._apply_transliteration_table(
+            text, transliteration_table, fallback_table)
 
-        for char in text:
-            if char in transliteration_table:
-                result_chars.append(transliteration_table[char])
-            elif self._is_cjk(char):
-                # Заменяем китайские, японские, корейские иероглифы на #
-                result_chars.append('#')
-            elif self._should_transliterate(char):
-                # Пытаемся нормализовать символ
-                try:
-                    # Пробуем декомпозицию символа
-                    decomposed = unicodedata.normalize('NFD', char)
-                    # Убираем диакритические знаки
-                    base_char = ''.join(c for c in decomposed if not unicodedata.combining(c))
-                    if base_char and base_char != char:
-                        result_chars.append(base_char)
-                    else:
-                        # Если нормализация не помогла, оставляем символ как есть
-                        result_chars.append(char)
-                except Exception:
-                    result_chars.append(char)
-            else:
-                result_chars.append(char)
-
-        result = ''.join(result_chars)
-        
         # Сохраняем результат транслитерации в состояние (если это имя файла)
         if filename:
             self.file_state['transliterated'] = result
@@ -480,6 +536,44 @@ class FileTransliterator(TransliterationTablesMixin):
                 return None
 
         return result
+
+    def _apply_transliteration_table(self, text: str, table: Dict[str, str],
+                                     fallback_table: Optional[Dict[str, str]] = None) -> str:
+        """Переводит текст по одной таблице.
+
+        Символ, которого нет в таблице, сначала ищется в fallback_table
+        (европейская таблица с декоративным слоем), затем нормализуется
+        (убираются диакритика и декоративные модификаторы), CJK заменяются
+        на '#'.
+        """
+        result_chars = []
+
+        for char in text:
+            if char in table:
+                result_chars.append(table[char])
+            elif fallback_table is not None and char in fallback_table:
+                result_chars.append(fallback_table[char])
+            elif self._is_cjk(char):
+                # Заменяем китайские, японские, корейские иероглифы на #
+                result_chars.append('#')
+            elif self._should_transliterate(char):
+                # Пытаемся нормализовать символ
+                try:
+                    # Пробуем декомпозицию символа
+                    decomposed = unicodedata.normalize('NFD', char)
+                    # Убираем диакритические знаки
+                    base_char = ''.join(c for c in decomposed if not unicodedata.combining(c))
+                    if base_char and base_char != char:
+                        result_chars.append(base_char)
+                    else:
+                        # Если нормализация не помогла, оставляем символ как есть
+                        result_chars.append(char)
+                except Exception:
+                    result_chars.append(char)
+            else:
+                result_chars.append(char)
+
+        return ''.join(result_chars)
 
     def _should_transliterate(self, char: str) -> bool:
         """Определяет, нужно ли транслитерировать символ"""
